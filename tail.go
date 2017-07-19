@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hpcloud/tail/ratelimiter"
-	"github.com/hpcloud/tail/util"
-	"github.com/hpcloud/tail/watch"
+	"github.com/foolbread/tail/ratelimiter"
+	"github.com/foolbread/tail/util"
+	"github.com/foolbread/tail/watch"
 	"gopkg.in/tomb.v1"
 )
 
@@ -25,15 +25,20 @@ var (
 	ErrStop = errors.New("tail should now stop")
 )
 
+const (
+	unknowOffset = -1
+)
+
 type Line struct {
 	Text string
 	Time time.Time
 	Err  error // Error from tail
+	Offset int64 // line offset
 }
 
 // NewLine returns a Line with present time.
 func NewLine(text string) *Line {
-	return &Line{text, time.Now(), nil}
+	return &Line{text, time.Now(), nil,unknowOffset}
 }
 
 // SeekInfo represents arguments to `os.Seek`
@@ -87,6 +92,8 @@ type Tail struct {
 	tomb.Tomb // provides: Done, Kill, Dying
 
 	lk sync.Mutex
+
+	offset int64
 }
 
 var (
@@ -202,6 +209,11 @@ func (tail *Tail) reopen() error {
 			}
 			return fmt.Errorf("Unable to open file %s: %s", tail.Filename, err)
 		}
+
+		tail.offset,err = tail.file.Seek(0,os.SEEK_CUR)
+		if err != nil{
+			return fmt.Errorf("get new offset %s: %s", tail.Filename, err)
+		}
 		break
 	}
 	return nil
@@ -240,7 +252,8 @@ func (tail *Tail) tailFileSync() {
 
 	// Seek to requested location on first open of the file.
 	if tail.Location != nil {
-		_, err := tail.file.Seek(tail.Location.Offset, tail.Location.Whence)
+		var err error
+		tail.offset, err = tail.file.Seek(tail.Location.Offset, tail.Location.Whence)
 		tail.Logger.Printf("Seeked %s - %+v\n", tail.Filename, tail.Location)
 		if err != nil {
 			tail.Killf("Seek error on %s: %s", tail.Filename, err)
@@ -275,7 +288,7 @@ func (tail *Tail) tailFileSync() {
 				// file when rate limit is reached.
 				msg := ("Too much log activity; waiting a second " +
 					"before resuming tailing")
-				tail.Lines <- &Line{msg, time.Now(), errors.New(msg)}
+				tail.Lines <- &Line{msg, time.Now(), errors.New(msg),unknowOffset}
 				select {
 				case <-time.After(time.Second):
 				case <-tail.Dying():
@@ -393,7 +406,8 @@ func (tail *Tail) seekEnd() error {
 }
 
 func (tail *Tail) seekTo(pos SeekInfo) error {
-	_, err := tail.file.Seek(pos.Offset, pos.Whence)
+	var err error
+	tail.offset, err = tail.file.Seek(pos.Offset, pos.Whence)
 	if err != nil {
 		return fmt.Errorf("Seek error on %s: %s", tail.Filename, err)
 	}
@@ -414,8 +428,11 @@ func (tail *Tail) sendLine(line string) bool {
 	}
 
 	for _, line := range lines {
-		tail.Lines <- &Line{line, now, nil}
+		tail.Lines <- &Line{line, now, nil,tail.offset}
+		tail.offset += int64(len(line))
 	}
+	//for /n
+	tail.offset++
 
 	if tail.Config.RateLimiter != nil {
 		ok := tail.Config.RateLimiter.Pour(uint16(len(lines)))
